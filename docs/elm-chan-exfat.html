@@ -1,0 +1,349 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html lang="en">
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<meta http-equiv="Content-Style-Type" content="text/css">
+<link rel="start" title="Site Top" href="../">
+<link rel="up" title="Tech Notes" href="../cc_e.html">
+<link rel="alternate" hreflang="ja" title="Japanese version" href="exfat.html">
+<link rel="stylesheet" href="docs_e.css" type="text/css" media="screen" title="ELM Default">
+<title>exFAT Filesystem</title>
+</head>
+
+<body>
+<div class="header">
+<p class="hdh"><a href="http://elm-chan.org/"><img src="../p/header.png" alt="ELM Home Page" width="400" height="27"></a></p>
+<p class="hdd">May 22, 2016<br>Update: May 5, 2017</p>
+<h1>exFAT Filesystem</h1>
+</div>
+<hr class="hds">
+
+<div class="abst">
+<p>This is a documentation about exFAT filesystem written based on the <cite>US. Pat. App. Pub. No. 2009/0164440 A1</cite> and some researches in behavior of standard systems (real Windows). It is for a supplemental attached to <a href="fat_e.html">FAT Filesystem</a>. You need to understand the FAT filesystem prior to read this documentation. There is a possibility of some unintended or intended error in this documentation, so that you need to refer the primary sources of exFAT filesystem and make sure behavior of the real systems when write any exFAT driver or utility.</p>
+</div>
+
+<ol>
+<li><a href="#intro">Introduction</a></li>
+<li><a href="#notes">exFAT Volume</a></li>
+<li><a href="#boot">Boot Sector</a></li>
+<li><a href="#fat_strucut">FAT and Allocation Bitmap</a></li>
+<li><a href="#upcase">Up-case Table</a></li>
+<li><a href="#dir_struct">Directory Entry</a></li>
+<li><a href="#fat_dir">Directory Operations</a></li>
+<li><a href="#partition">Disk Partitioning</a></li>
+</ol>
+
+<h3 id="intro">Introduction</h3>
+<p>The exFAT filesystem (Microsoft Extended FAT Filesystem) was developped as a succession of industry standard FAT filesystem widely used for removable media and built-in storages in embedded systems. For this reason, it is designed based on the FAT filesystem to be easily implemented to existng systems. This documentation describes mainly the differences between these filesystems. exFAT filesystem has some advantages of FAT filesystem as follows.</p>
+<ul>
+<li>Supports file size of over 4 GB (virtually unlimited).</li>
+<li>Supports volume size of over 2 TB (virtually unlimited).</li>
+<li>Improved performance of cluster allocation by allocation bitmap.</li>
+<li>Improved performance of data transfer by extended cluster size (up to 32 MB).</li>
+<li>Supports UTC timestamp (optional).</li>
+<li>Supports transaction safe filesystem (optional for WindowsCE).</li>
+</ul>
+
+<h4>About Notations in this Document</h4>
+<p>Numbers with heading 0x are assumed to be hexadecimal numbers, and others are decimal numbers.</p>
+<p>The prefix K, M, G and T of each unit is assumed to be 2<sup>10</sup>, 2<sup>20</sup>, 2<sup>30</sup> and 2<sup>40</sup> respectively.</p>
+<p>The fragment of program codes contained in this document are written in C language, but it is not strict to the syntax.</p>
+<p>32-bit value and 16-bit value are arbitrary mixed in the fragment of the program codes. The programmer needs be aware of the data loss due to the type conversion and how to avoid it. Also, every data type is assumed to be <em>unsigned</em>. Do not calculate in signed, or it may result unintended results.</p>
+
+
+
+<h3 id="notes">exFAT Volume</h3>
+<p>The exFAT volume is composed of three areas. Each area is located on the volume in order of as follows: (<a href="rc/exfat_map.png">exFAT Volume Map</a>)</p>
+<ol>
+<li>Boot Area (volume configuration parameters)</li>
+<li>FAT Area (for only fragmented cluster chains)</li>
+<li>Data Area (file, directroy and some system structures)</li>
+</ol>
+
+<h3 id="boot">Boot Sector</h3>
+<p>Volume configuration parameters are recoreded in the boot sector as FAT filesystem does. The exFAT boot sector is actually in 12 contiguous sectors block, and two set of boot sectors (main and backup) are set in the boot area where the top of the exFAT volume. Each boundaries, sizes and count of clusters are explicitly recorded in the boot sector and there is nothing unclear in volume recognization.</p>
+<table class="lst4" id="bs_main">
+<caption>Boot Sector (sector 0)</caption>
+<tr><th>Field name</th><th>Offset</th><th>Size</th><th>Description</th></tr>
+<tr><td>JumpBoot</td><td>0</td><td>3</td>
+<td>Jump instruction to the <tt>BootCode</tt> (x86 instruction). Must be <tt>0xEB, 0x76, 0x90</tt>.</td>
+</tr>
+<tr><td>FileSystemName</td><td>3</td><td>8</td>
+<td>Filesystem name. Must be <tt>"EXFAT&nbsp;&nbsp;&nbsp;"</tt>.</td>
+</tr>
+<tr><td>MustBeZero</td><td>11</td><td>53</td>
+<td>This field must be filled with zeros and spans where the BPB of FAT filesystem. This is to prevent misrecognizing as FAT volume.</td>
+</tr>
+<tr><td>PartitionOffset</td><td>64</td><td>8</td>
+<td>Offset of this exFAT volume origin from top of the hosting physical drive in unit of sector. The value zero indicates this field has no meaning and should be ignored.</td>
+</tr>
+<tr><td>VolumeLength</td><td>72</td><td>8</td>
+<td>Size of this exFAT volume includes three areas (boot, FAT and data) in unit of sector. The minimum volume size is 1 MB. Unlike the FAT volume, this value must be exactly same as the size of its container (the partition in MBR format or the pysical drive in SFD format), or Windows OS will not mount this exFAT volume.</td>
+</tr>
+<tr><td>FatOffset</td><td>80</td><td>4</td>
+<td>Offset of FAT area origin from top of the volume in unit of sector.</td>
+</tr>
+<tr><td>FatLength</td><td>84</td><td>4</td>
+<td>Size of an FAT in unit of sector.</td>
+</tr>
+<tr><td>ClusterHeapOffset</td><td>88</td><td>4</td>
+<td>Offset of cluster heap (data area) origin from top of the volume in unit of sector.</td>
+</tr>
+<tr><td>ClusterCount</td><td>92</td><td>4</td>
+<td>Number of clusters on the volume. 0xFFFFFFF5 maximum.</td>
+</tr>
+<tr><td>FirstClusterOfRootDirectory</td><td>96</td><td>4</td>
+<td>First cluster number of the root directory.</td>
+</tr>
+<tr><td>VolumeSerialNumber</td><td>100</td><td>4</td>
+<td>Volume serial number. This value is a random number typically generated from current time and date.</td>
+</tr>
+<tr><td>FileSystemRevision</td><td>104</td><td>2</td>
+<td>Filesystem revision. Upper byte indicates the major number and lower byte inidicates the minor numer, e.g. 0x020B indicates the revision 2.11. This document describes about exFAT revision 1.0.</td>
+</tr>
+<tr><td>VolumeFlags</td><td>106</td><td>2</td>
+<td>This field contains some flags to indicate status of this volume as described below:<br>
+bit0 (ActiveFat): 0 indicates the first FAT and allocation bitmap are used, 1 indicates the second FAT and allocation bitmap are used (TexFAT option)<br>bit1 (VolumeDirty): Set on mount, restored on unmount. If it is already set on mount, it means there is a possibility of some insanity in the volume. Cleard after a volume sanity check.<br>bit2 (MediaFailure): Set on unrecoverable disk error, cleared after a surface scan.<br>bit3-15: Reserved (0).</td>
+</tr>
+<tr><td>BytesPerSectorShift</td><td>108</td><td>1</td>
+<td>Sector size in unit of byte expressed in log2. Valid value for this field is 9 to 12 (512 to 4096 bytes). It should be same as read/write block size of the storage device that hosts this volume.</td>
+</tr>
+<tr><td>SectorsPerClusterShift</td><td>109</td><td>1</td>
+<td>Cluster size in unit of sector expressed in log2. Valid value for this field is 0 to 25-BytesPerSectorShift (one sector to 32 MB).</td>
+</tr>
+<tr><td>NumberOfFats</td><td>110</td><td>1</td>
+<td>Number of FATs and allocation bitmaps. 1 indicates one FAT and one allocation bitmap are exist. 2 indicates two FATs and two allocation bitmaps are exitst. Always 1 for removable media, 2 for TexFAT volume option.</td>
+</tr>
+<tr><td>DriveSelect</td><td>111</td><td>1</td>
+<td>Drive number used by disk BIOS (typically 0x80). This field is used in bootstrap program. Actually it depends on the OS.</td>
+</tr>
+<tr><td>PercentInUse</td><td>112</td><td>1</td>
+<td>Volume usage in unit of percent. 0xFF means this field is not used and invalid.</td>
+</tr>
+<tr><td>Reserved</td><td>113</td><td>7</td>
+<td>Reserved and should be filled with zero.</td>
+</tr>
+<tr><td>BootCode</td><td>120</td><td>390</td>
+<td>Boot program. This is a system dependent field and filled with zeros when not used.</td>
+<tr><td>BootSignature</td><td>510</td><td>2</td>
+<td>0xAA55. Boot signature used to validate that this is a boot sector.</td>
+<tr><td></td><td>512</td><td></td>
+<td>If the sector size is larger than 512 bytes, rest field in the sector is undefined.</td>
+</tr>
+</table>
+
+<table class="lst4" id="bs_ext">
+<caption>Extended Boot Sector (sector 1-8)</caption>
+<tr><th>Field name</th><th>Offset</th><th>Size</th><th>Description</th></tr>
+<tr><td>ExtendedBootCode</td><td>0</td><td>2<sup>BytesPerSectorShift</sup>-4</td>
+<td>Extended boot code. This is system dependent field and filled with zero when not used.</td>
+<tr><td>ExtededBootSignature</td><td>2<sup>BytesPerSectorShift</sup>-4</td><td>4</td>
+<td>0xAA550000. Boot signature used to validate that this is an extended boot sector.</td>
+</tr>
+</table>
+
+<p>Sector 9 contains OEM parameter and sector 10 is reserved for future use. The content of these sectors is depends on the system and filled with zero when not used. Sector 11 is filled with 32-bit check sum values of from sector 0 to sector 10 inclusive. These 11 sectors are calculated in byte-by-byte as a simple byte array, however <tt>VolumeFlags</tt> and <tt>PercentInUse</tt> are excluded from the calculation.</p>
+<pre><span class="c">/* Calculation of 32-bit check sum */</span>
+uint32_t sum32 (const void* p, uint32_t n)
+{
+    uint32_t sum = 0;
+    const uint8_t *dp = (const uint8_t*)p;
+
+    do {
+        sum = ((sum &amp; 1) ? 0x80000000 : 0) + (sum >> 1) + *dp++;
+    } while (--n);
+
+    return sum;
+}
+</pre>
+<pre><span class="c">/* Calculation of 16-bit check sum */</span>
+uint16_t sum16 (const void* p, uint32_t n)
+{
+    uint16_t sum = 0;
+    const uint8_t *dp = (const uint8_t*)p;
+
+    do {
+        sum = ((sum &amp; 1) ? 0x8000 : 0) + (sum >> 1) + *dp++;
+    } while (--n);
+
+    return sum;
+}
+</pre>
+
+
+<h3 id="fat_strucut">FAT and Allocation Bitmap</h3>
+<p>The exFAT FAT entry is 32-bit in size as FAT32 FAT entry except for all bits in each entries are used. exFAT has adopted <em>allocation bitmap</em> to manage the cluster allocation status, free or not. The first bit of the allocation bitmap (bit0 of the first byte) corresponds to the cluseter 2. The bit value 1 means the cluster is in-use and not free for new allocation. The bit value 0 means the cluster is free and the value of FAT entry has no meaning. This is a significant difference of exFAT filesystem from FAT filesystem which indicates free cluster by a zero in the FAT entry. Following table shows the status of a cluster and corresponding entries. In the special case, the value in the FAT entry can have no meaning even if the cluster is in-use. This is described in Directory Operations.</p>
+<table class="lst" id="fat_value">
+<tr><th>bitmap</th><th>FAT</th><th>Cluster status</th></tr>
+<tr><td>0</td><td>(Don't care)</td><td>Free</td></tr>
+<tr><td>1</td><td>0 - 1</td><td>(Reserved)</td></tr>
+<tr><td>1</td><td>2 - ClusterCount+1</td><td>In-use (value is link to next)</td></tr>
+<tr><td>1</td><td>ClusterCount+2 - 0xFFFFFFF6</td><td>(Reserved)</td></tr>
+<tr><td>1</td><td>0xFFFFFFF7</td><td>Bad cluster</td></tr>
+<tr><td>1</td><td>0xFFFFFFF8 - 0xFFFFFFFE</td><td>(Reserved)</td></tr>
+<tr><td>1</td><td>0xFFFFFFFF</td><td>In-use (end of chain)</td></tr>
+</table>
+<p>The allocation bitmap is recored in the data area and its allocation information (start cluster and size) is recorded as a special directory entry (described in Directory Entry) on the root directory. The sizeof allocation bitmap becomes (ClusterCount + 7) / 8 bytes.</p>
+
+
+<h3 id="upcase">Up-case Table</h3>
+<p>In the exFAT filesystem, file names are handled as LFN extension of FAT filesystem does. Case information is preserved on recording, and matched in case insensitive. exFAT volume has up-case table <em>on the volume</em> for up-case conversion while it is done with on-system conversion table at the FAT filesystem. Perhaps, this is for new character definitions in the future. However what occures on the compatibility between the changes and existing systems is not clear. The up-case table needs to support ASCII alhpabetic character at least, and non-ASCII characters are optional. According to a research into the exFAT volume formatted by Windows, it seems to be same as FAT filesystem on the Windows does, but it is not that kept unchanged in the future.</p>
+<p>The up-case table seems to support only BMP where corresponds to U+0000 - U+FFFF. It is recorded on the volume in compressed form. The following function is to extract the compressed table and create a case conversion table.</p>
+<pre>
+void load_upcase (
+    uint16_t dst[],  <span class="c">/* Output table for U+0000 - U+FFFF */</span>
+    uint16_t src[],  <span class="c">/* Compressed table to input */</span>
+    uint16_t n_src   <span class="c">/* Size of compressed table [items] */</span>
+)
+{
+    uint16_t c, si, di;
+
+    <span class="c">/* Fill output table with default values */</span>
+    c = 0; do dst[c] = c; while (++c);
+
+    si = di = 0;
+    do {
+        c = src[si++];        <span class="c">/* Get an up-case character */</span>
+        if (c == 0xFFFF &amp;&amp; si &lt; n_src) {
+            di += src[si++];  <span class="c">/* When U+FFFF appeared, skip the codes indicated by next item */</span>
+        } else {
+            dst[di++] = c;    <span class="c">/* Store the up-case character */</span>
+        }
+    } while (si &lt; n_src);
+}
+</pre>
+<p>Up-case table is recorded in the data area  and its allocation information (start cluster and size) is recorded in a special directory entry (this is described below) on the root directory.</p>
+
+
+<h3 id="dir_struct">Directory Entry</h3>
+<h4>Entry Type</h4>
+<p>Root directory is recorded in the data area. The first cluster number is stored in <tt>FirstClusterOfRootDirectory</tt>. The size of directory entry is 32 bytes. These are saeme as FAT filesystem does. Maximum length of a directory is 256 MB (8 M enrtries) while 2 MB at FAT filesystem. The first byte of each entry indicates the type of the entry. It is divided into four bit fields as shown below</p>
+<table class="lst4" id="dir_typef">
+<caption>Bit field in EntryType byte</caption>
+<tr><th>Field</th><th>Meaning</th></tr>
+<tr><td>InUse(bit7)</td><td>0 = Free entry, 1 = Entry is in-use.</td></tr>
+<tr><td>TypeCategory(bit6)</td><td>0 = Primary entry, 1 = Secondary entry attached to primary entry.</td></tr>
+<tr><td>TypeImportance(bit5)</td><td>0 = Critcal entry, 1 = Benign entry.</td></tr>
+<tr><td>TypeCode(bit4-0)</td><td>0-31: Type code.</td></tr>
+</table>
+<p>Therefore the EntryType byte provides the information about the entry, but in fact the inportant thing is its value to identify the entry type. Following table shows the defined value and entry type. Last four entry types in the table are optional for generic use or not defined for exFAT 1.00, so that they are not described in this documentation.</p>
+<table class="lst4" id="dir_type">
+<caption>Entry type and </caption>
+<tr><th><tt>EntryType</tt></th><th>Description</th></tr>
+<tr><td>0x81</td><td>Allocation bitmap</td></tr>
+<tr><td>0x82</td><td>Up-case table</td></tr>
+<tr><td>0x83</td><td>Volume label</td></tr>
+<tr><td>0x85</td><td>File and directory (file attribute and timestamp)</td></tr>
+<tr><td>0xC0</td><td>Stream extension (file allocation information)</td></tr>
+<tr><td>0xC1</td><td>File name (name of the file)</td></tr>
+<tr><td>0xC2</td><td>Windows CE access control list</td></tr>
+<tr><td>0xA0</td><td>Volume GUID</td></tr>
+<tr><td>0xA1</td><td>TexFAT Padding</td></tr>
+<tr><td>0xA2</td><td>Windows CE access control table</td></tr>
+</table>
+<p>EntryType is the only common field for every type of entries and other fields are defined for each entry types individually. To delete an entry, clear InUse bit of EntryType instead of storeing 0xE5 what FAT filessytem does. If EntryType is zero, all following enrties in the directory are guaranteed zero.</p>
+
+<h4>Allocation Bitmap Entry</h4>
+<p>Contains allocation information of allocation bitmap. This entry is recorded in the root directory independently.</p>
+<table class="lst4" id="dir_81">
+<tr><th>Field name</th><th>Ofs</th><th>Size</th><th>Function</th></tr>
+<tr><td><tt>EntryType</tt></td><td>0</td><td>1</td><td>0x81 (Allocaation bitmap entry).</td></tr>
+<tr><td><tt>BitMapFlags</tt></td><td>1</td><td>1</td><td>Bit0: 0 = 1st bitmap, 1 = 2nd bitmap.<br>Bit7-1: Reserved (0).</td></tr>
+<tr><td><tt>Reserved</tt></td><td>2</td><td>18</td><td>Reserved (0).</td></tr>
+<tr><td><tt>FirstCluster</tt></td><td>20</td><td>4</td><td>First cluster number of this allocation bitmap.</td></tr>
+<tr><td><tt>DataLength</tt></td><td>24</td><td>8</td><td>Size of bitmap in unit of byte.</td></tr>
+</table>
+
+<h4>Up-case Table Entry</h4>
+<p>Contains allocation information of up-case table. This entry is recorded in the root directory independently.</p>
+<table class="lst4" id="dir_82">
+<tr><th>Field name</th><th>Ofs</th><th>Size</th><th>Function</th></tr>
+<tr><td><tt>EntryType</tt></td><td>0</td><td>1</td><td>0x82 (Up-case table entry).</td></tr>
+<tr><td><tt>Reserved1</tt></td><td>1</td><td>3</td><td>Reserved (0).</td></tr>
+<tr><td><tt>TableChecksum</tt></td><td>4</td><td>4</td><td>32-bit checksum of the up-case table.</td></tr>
+<tr><td><tt>Reserved2</tt></td><td>8</td><td>12</td><td>Reserved (0).</td></tr>
+<tr><td><tt>FirstCluster</tt></td><td>20</td><td>4</td><td>First cluster number of the up-case table.</td></tr>
+<tr><td><tt>DataLength</tt></td><td>24</td><td>8</td><td>Size of the table in unit of byte.</td></tr>
+</table>
+
+<h4>Volume Label Entry</h4>
+<p>Contains volume label of this volume. This entry is recorded in the root directory independently. If the size field is zero or this entry is not exist, the volume has no volume label. Any character allowed for file name <em>includes dot</em> can be used for the volume label.</p>
+<table class="lst4" id="dir_83">
+<tr><th>Field name</th><th>Ofs</th><th>Size</th><th>Function</th></tr>
+<tr><td><tt>EntryType</tt></td><td>0</td><td>1</td><td>0x83 (Volume label entry).</td></tr>
+<tr><td><tt>CharacterCount</tt></td><td>1</td><td>1</td><td>Size of volume label in unit of character  0 to 11 inclusive.</td></tr>
+<tr><td><tt>VolumeLabel</tt></td><td>2</td><td>22</td><td>Volume label string in UTF-16LE. Unlike FAT filesystem, case information is preserved and trailing spaces are valid as a part of the label.</td></tr>
+<tr><td><tt>Reserved</tt></td><td>24</td><td>8</td><td>Reserved (0).</td></tr>
+</table>
+
+
+<h4>File and Directory Entry</h4>
+<p>This is one of the entry types which composes an <em>entry set</em>. It indicates start of an entry set and contains file attribute and timestamp. The entry set is a block of consecutive directory entries to record meta data of a file or sub-directory. It is set on the direcotry in order of this entry (1 entry), stream extension entry (1 entry), and name extensiton entries (1-17 entries), so that an entry set spans from 3 to 19 entries.</p>
+<table class="lst4" id="dir_85">
+<tr><th>Field name</th><th>Ofs</th><th>Size</th><th>Function</th></tr>
+<tr><td><tt>EntryType</tt></td><td>0</td><td>1</td><td>0x85 (File and directory entry).</td></tr>
+<tr><td><tt>SecondaryCount</tt></td><td>1</td><td>1</td><td>Number of following entries. The size of this entry set is <tt>SecondaryCount</tt>+1 entries.</td></tr>
+<tr><td><tt>SetCheckSum</tt></td><td>2</td><td>2</td><td>A 16-bit checksum to validate this entry set. The checksum of an entry set is calculated in byte-by-byte as a simple byte array excluding only this field.</td></tr>
+<tr><td>FileAttribute</td><td>4</td><td>2</td><td>File attribute in combination of following flags. The meaning of these flags are same as FAT filesystem.<br>bit0: Read-Only.<br>bit1: Hidden.<br>bit2: System.<br>bit3: Reserved (0).<br>bit4: Directory.<br>bit5: Archive.<br>bit6-15: Reserved (0).<br></td></tr>
+<tr><td>Reserved1</td><td>6</td><td>2</td><td>Reserved (0).</td></tr>
+<tr><td>CreateTimestamp</td><td>8</td><td>4</td><td>Timestamp of the file created. Upper 16 bits contains the local date and lower 16 bits contains the local time. Each fields in the date and time are same as FAT filesystem.</td></tr>
+<tr><td>LastModifiedTimestamp</td><td>12</td><td>4</td><td>Timestamp of the file modified.</td></tr>
+<tr><td>LastAccessedTimestamp</td><td>16</td><td>4</td><td>Timestamp of the file accessed.</td></tr>
+<tr><td>Create10msIncrement</td><td>20</td><td>1</td><td>Sub-second information of <tt>CreateTimestamp</tt> in unit of 10 ms (from 0 to 199).</td></tr>
+<tr><td>LastModified10msIncrement</td><td>21</td><td>1</td><td>Sub second information of <tt>LastModifiedTimestamp</tt>.</td></tr>
+<tr><td>CreateTZOffset</td><td>22</td><td>1</td><td>Time zone offset of <tt>CreateTimestamp</tt> in unit of quarter hour with ORed by 0x80. For example, <tt>+9 * 4 | 0x80 = 0xA4</tt> for JST(+9:00), <tt>-7 * 4 | 0x80 = 0xE0</tt> for PST(-7:00). The timestamp in UTC can be got by this field. Set 0x00 when time zone is not used.</td></tr>
+<tr><td>LastModifiedTZOffset</td><td>23</td><td>1</td><td>Timezone offset of <tt>LastModifiedTimestamp</tt>.</td></tr>
+<tr><td>LastAccessedTZOffset</td><td>24</td><td>1</td><td>Timezone offset of <tt>LastAccessedTimestamp</tt>.</td></tr>
+<tr><td>Reserved2</td><td>25</td><td>7</td><td>Reserved (0).</td></tr>
+</table>
+
+<h4>Stream Extension Enrty</h4>
+<p>This is one of the entry types which composes an entry set. It contains the file allocation information.</p>
+<table class="lst4" id="dir_C0">
+<tr><th>Field name</th><th>Ofs</th><th>Size</th><th>Function</th></tr>
+<tr><td><tt>EntryType</tt></td><td>0</td><td>1</td><td>0xC0 (Stream extension entry).</td></tr>
+<tr><td><tt>GeneralSecondaryFlags</tt></td><td>1</td><td>1</td>
+<td>These flags indicate status of the file allocation.<br>bit0(<tt>AllocationPossible</tt>): 0 = Cluster allocation is not possible and <tt>FirstCluster</tt> and <tt>DataLength</tt> field are undefined, 1 =  Cluster allocation is possible and <tt>FirstCluster</tt> and <tt>DataLength</tt> field are valid as defined.<br>bit1(<tt>NoFatChain</tt>): 0 = Cluster chain on the FAT is valid, 1 = Cluster chain is contiguous and not recorded on the FAT.<br>bit2-15: Reserved (0).<br>If <tt>AllocationPossible</tt> flag is 0 (actually always 1), <tt>ValidDataLength, FirstCluster, DataLength</tt> are invalid. When cluster chain is contiguous, <tt>NoFatChain</tt> can be set and any recording on the FAT is not needed.</td>
+</tr>
+<tr><td><tt>Reserved1</tt></td><td>2</td><td>1</td><td>Reserved (0).</td></tr>
+<tr><td><tt>NameLength</tt></td><td>3</td><td>1</td><td>Length of the file name in UTF-16 encoding unit. Valid value for this field is 1 to 255.</td></tr>
+<tr><td><tt>NameHash</tt></td><td>4</td><td>2</td><td>16-bit checksum of the up-case converted file name. The value is calculated in byte-by-byte as a UTF-16LE string. This enables to skip comparison at most unmatched file when look for a file in the directory.</td></tr>
+<tr><td><tt>Reserved2</tt></td><td>6</td><td>2</td><td>Reserved (0).</td></tr>
+<tr><td><tt>ValidDataLength</tt></td><td>8</td><td>8</td><td>Valid data length of the file in unit of byte. It indicates how long the data actually written. Valid value for this field is 0 to <tt>DataLength</tt>. Any data located beyond this offset is undefined and zeros should be returned if read it. This is the feature to implement fallocate() efficiently. As for the sub-directories, the value must be equal to <tt>DataLength</tt>.</td></tr>
+<tr><td><tt>Reserved3</tt></td><td>16</td><td>4</td><td>Reserved (0).</td></tr>
+<tr><td><tt>FirstCluster</tt></td><td>20</td><td>4</td><td>First cluster number of the cluster chain. When <tt>DataLength</tt> is zero, also this value must be zero and the file does not have cluster chain.</td></tr>
+<tr><td><tt>DataLength</tt></td><td>24</td><td>8</td><td>Actual length of the file in unit of byte. Size of sub-directory is always multiple of cluster size.</td></tr>
+</table>
+
+<h4>File Name Entry</h4>
+<p>This is one of the entry types which composes an entry set. It contains the file name string. Any character except for control characters (U+0000 to U+001F, U+007F) and <tt>&quot; * / : &lt; &gt; ? \ |</tt> is allowable for file name as LFN extensiton of FAT filesystem. exFAT filesystem does not support alternative file name (SFN) what FAT filesystem supports.</p>
+<table class="lst4" id="dir_C1">
+<tr><th>Field name</th><th>Ofs</th><th>Size</th><th>Function</th></tr>
+<tr><td><tt>EntryType</tt></td><td>0</td><td>1</td><td>0xC1 (File name enrty).</td></tr>
+<tr><td><tt>GeneralSecondaryFlags</tt></td><td>1</td><td>1</td><td>Always 0.</td></tr>
+<tr><td><tt>FileName</tt></td><td>2</td><td>30</td><td>Contains file name string in UTF-16LE. If the name length is less than 15 characters, rest of space in this field is filled with zero. If the name length exceeds 15 characters, multiple file entries (<tt>(NameLength + 14) / 15</tt>) are used and set in the entry block in ascending order.</td></tr>
+</table>
+
+<p><a href="rc/exfat_dir.png">This</a> is an example of exFAT root directory after formatting and a file creation. You will able to see how the entries are stored on the directory.</p>
+
+
+<h3 id="fat_dir">Directory Operations</h3>
+<h4>Creating a File</h4>
+<p>To create a file, find a block of free entries in the directory and create the entry set of the file. The entry set has <tt>Archive</tt> attrribute and set <tt>DataLength</tt> field to zero as initial value. <tt>AllocationPossible</tt> bit is always 1 and <tt>NoFatChain</tt> bit is initially cleared.</p>
+<p>When the first data is written to the file and a new cluster is allocated, the cluster number is set to <tt>FirstCluster</tt> and set <tt>NoFatChain</tt> bit. Thereafter no data is written to the FAT entries as long as the cluster chain is contiguous. If the cluster chain is fragmented on the next cluster allocation, record a valid cluster chain on the FAT and clear <tt>NoFatChain</tt> bit. This is applied to only file and sub-directory. Any other object (root directory, allocation bitmap and up-case table) always have valid cluster chain on the FAT because they don't have <tt>NoFatChain</tt> bit.</p>
+<h4>Creating a Sub-directory</h4>
+<p>To create a sub-directory, find a block of free entries in the directory and create the entry set of the sub-directory. The entry set has <tt>Directory</tt> attrribute. A new cluster is initially allocated to the sub-directory and the cluster is filled with zero. <tt>NoFatChain</tt> bit is as described above. When the sub-directory gets full, the cluster chain is stretched a cluster and the cluster is filled with zero. The maximum length of a direcotry is 256 MB (8 M entries).</p>
+<p>There are significant difference from FAT sub-directory. <tt>DataLength</tt> field must have a valid value and two dot entries (<tt>".", ".."</tt>) on the FAT sub-directory are no longer exist on the exFAT sub-directory. The dot entries may be logically generated and appeared in the directory listing API.</p>
+<h4>Deleting a File</h4>
+<p>To remove a file, clear <tt>InUse</tt> bit in each entries of the file entry set. If the file has a cluster chain, also the chain needs to be removed from the FAT. In this case the FAT entries do not need to be changed because the clusters get free by clearing the allocation bitmap.</p>
+<h4>Deleting a Sub-directorty</h4>
+<p>It is same as deleting a file. All nodes below the directory needs to be scanned and all files and directories in the directory need to be deleted prior to delete the directory, or those objects' clusters get lost clusters.</p>
+
+
+<h3 id="partition">Disk Partitioning</h3>
+<p>Same as the description of FAT filesystem. The value of system type in the partition table for exFAT volume is 0x07, which is same as NTFS. However MBR format does not support the storage device larger than 2 TB, because the allocation information in the partition table is recorded in 32-bit LBA. To use such storage device, it needs to be in SFD format or GPT format.</p>
+
+
+<p class="foot"><img src="../p/sign.png" alt=""></p>
+</body>
+</html>
