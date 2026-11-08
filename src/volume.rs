@@ -250,12 +250,44 @@ fn read_boot_region(file: &File) -> Result<(BootSector, OemParameters)> {
     }
 }
 
-/// Number of contiguous cluster runs in `chain`.
-pub fn chunk_count(chain: &[u32]) -> usize {
-    if chain.is_empty() {
-        return 0;
+/// Byte size of each contiguous cluster run.
+///
+/// Full clusters are `cluster_size` bytes. The last run is truncated so the
+/// sizes sum to `data_length` when that is smaller than the allocation.
+pub fn chunk_sizes(chain: &[u32], cluster_size: u64, data_length: u64) -> Vec<u64> {
+    if chain.is_empty() || cluster_size == 0 {
+        return Vec::new();
     }
-    1 + chain.windows(2).filter(|w| w[1] != w[0] + 1).count()
+
+    let mut sizes = Vec::new();
+    let mut run = 1u64;
+    for pair in chain.windows(2) {
+        if pair[1] == pair[0] + 1 {
+            run += 1;
+        } else {
+            sizes.push(run * cluster_size);
+            run = 1;
+        }
+    }
+    sizes.push(run * cluster_size);
+
+    if data_length == 0 {
+        return sizes;
+    }
+
+    let mut remaining = data_length;
+    for size in &mut sizes {
+        if remaining == 0 {
+            *size = 0;
+        } else if *size > remaining {
+            *size = remaining;
+            remaining = 0;
+        } else {
+            remaining -= *size;
+        }
+    }
+    sizes.retain(|&s| s > 0);
+    sizes
 }
 
 #[cfg(test)]
@@ -264,10 +296,25 @@ mod tests {
 
     #[test]
     fn chunks_of_contiguous_and_scattered() {
-        assert_eq!(chunk_count(&[]), 0);
-        assert_eq!(chunk_count(&[5]), 1);
-        assert_eq!(chunk_count(&[5, 6, 7]), 1);
-        assert_eq!(chunk_count(&[5, 176, 348]), 3);
-        assert_eq!(chunk_count(&[5, 6, 10, 11, 12]), 2);
+        let cs = 1;
+        assert!(chunk_sizes(&[], cs, 0).is_empty());
+        assert_eq!(chunk_sizes(&[5], cs, 1).len(), 1);
+        assert_eq!(chunk_sizes(&[5, 6, 7], cs, 3).len(), 1);
+        assert_eq!(chunk_sizes(&[5, 176, 348], cs, 3).len(), 3);
+        assert_eq!(chunk_sizes(&[5, 6, 10, 11, 12], cs, 5).len(), 2);
+    }
+
+    #[test]
+    fn chunk_sizes_full_and_partial() {
+        let cs = 4096;
+        assert!(chunk_sizes(&[], cs, 0).is_empty());
+        assert_eq!(chunk_sizes(&[5], cs, 4096), vec![4096]);
+        assert_eq!(chunk_sizes(&[5, 6, 7], cs, 3 * cs), vec![3 * cs]);
+        assert_eq!(chunk_sizes(&[5, 176, 348], cs, 3 * cs), vec![cs, cs, cs]);
+        assert_eq!(
+            chunk_sizes(&[5, 6, 10, 11, 12], cs, 5 * cs),
+            vec![2 * cs, 3 * cs]
+        );
+        assert_eq!(chunk_sizes(&[5, 7, 8], cs, 5000), vec![4096, 904]);
     }
 }

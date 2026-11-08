@@ -1,5 +1,5 @@
 use crate::structs::*;
-use crate::volume::{Volume, chunk_count};
+use crate::volume::{Volume, chunk_sizes};
 use crate::{Error, Result};
 
 /// A file or directory whose cluster allocation is not a single contiguous run.
@@ -8,8 +8,15 @@ pub struct FragmentedEntry {
     pub path: String,
     pub is_directory: bool,
     pub size: u64,
-    pub chunks: usize,
+    /// Byte size of each contiguous cluster run, in chain order.
+    pub chunk_sizes: Vec<u64>,
     pub clusters: usize,
+}
+
+impl FragmentedEntry {
+    pub fn chunks(&self) -> usize {
+        self.chunk_sizes.len()
+    }
 }
 
 /// Walk the directory tree and collect files/directories with more than one cluster run.
@@ -18,14 +25,15 @@ pub fn analyze(vol: &Volume) -> Result<Vec<FragmentedEntry>> {
 
     let root_first = vol.boot.first_cluster_of_root_directory;
     let root_chain = vol.cluster_chain(root_first, 0, false)?;
-    let root_size = root_chain.len() as u64 * vol.cluster_size() as u64;
-    let root_chunks = chunk_count(&root_chain);
-    if root_chunks > 1 {
+    let cluster_size = vol.cluster_size() as u64;
+    let root_size = root_chain.len() as u64 * cluster_size;
+    let root_chunk_sizes = chunk_sizes(&root_chain, cluster_size, root_size);
+    if root_chunk_sizes.len() > 1 {
         out.push(FragmentedEntry {
             path: "/".to_string(),
             is_directory: true,
             size: root_size,
-            chunks: root_chunks,
+            chunk_sizes: root_chunk_sizes,
             clusters: root_chain.len(),
         });
     }
@@ -40,14 +48,14 @@ pub fn analyze(vol: &Volume) -> Result<Vec<FragmentedEntry>> {
                 record.data_length(),
                 record.no_fat_chain(),
             )?;
-            let chunks = chunk_count(&chain);
+            let sizes = chunk_sizes(&chain, cluster_size, record.data_length());
             let path = join_path(&dir_path, &record.name);
-            if chunks > 1 {
+            if sizes.len() > 1 {
                 out.push(FragmentedEntry {
                     path: path.clone(),
                     is_directory: record.is_directory(),
                     size: record.data_length(),
-                    chunks,
+                    chunk_sizes: sizes,
                     clusters: chain.len(),
                 });
             }
@@ -234,9 +242,10 @@ mod tests {
         );
         for e in &found {
             assert!(e.is_directory);
-            assert!(e.chunks > 1);
+            assert!(e.chunks() > 1);
             assert_eq!(e.size, 98304);
-            assert_eq!(e.chunks, 6);
+            assert_eq!(e.chunks(), 6);
+            assert_eq!(e.chunk_sizes, vec![16384; 6]);
         }
     }
 }

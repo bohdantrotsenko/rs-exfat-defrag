@@ -29,10 +29,24 @@ fn run(path: &str) -> rs_exfat_defrag::Result<()> {
     let vol = Volume::open(path)?;
     let entries = analyze(&vol)?;
 
-    println!("{:4} {:>12} {:>6}  PATH", "TYPE", "SIZE", "CHUNKS");
+    println!(
+        "{:4} {:>12} {:>6}  {:<40}  PATH",
+        "TYPE", "SIZE", "CHUNKS", "CHUNK SIZES"
+    );
     for e in &entries {
         let kind = if e.is_directory { "dir" } else { "file" };
-        println!("{kind:4} {:>12} {:>6}  {}", e.size, e.chunks, e.path);
+        let sizes = e
+            .chunk_sizes
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join("+");
+        println!(
+            "{kind:4} {:>12} {:>6}  {sizes:<40}  {}",
+            e.size,
+            e.chunks(),
+            e.path
+        );
     }
     Ok(())
 }
