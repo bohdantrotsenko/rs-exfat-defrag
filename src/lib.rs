@@ -4,10 +4,12 @@
 //! revision 1.00.
 
 mod analysis;
+mod defrag;
 mod structs;
 mod volume;
 
-pub use analysis::{FragmentedEntry, analyze};
+pub use analysis::{FragmentedEntry, analyze, analyze_filtered};
+pub use defrag::{DefragOptions, DefragStats, defrag};
 pub use structs::*;
 pub use volume::Volume;
 

@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
@@ -12,18 +12,29 @@ pub struct Volume {
     pub boot: BootSector,
     pub oem: OemParameters,
     fat: Vec<u32>,
+    fat_off: u64,
+    writable: bool,
 }
 
 impl Volume {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, false)
+    }
+
+    pub fn open_read_write(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: impl AsRef<Path>, writable: bool) -> Result<Self> {
         let path = path.as_ref();
-        let file = File::open(path)?;
+        let file = OpenOptions::new().read(true).write(writable).open(path)?;
         let (boot, oem) = read_boot_region(&file)?;
         boot.validate()?;
 
         let bps = boot.bytes_per_sector();
         let active = boot.volume_flags.active_fat() as u32;
         let fat_sector = boot.fat_offset + active * boot.fat_length;
+        let fat_off = fat_sector as u64 * bps as u64;
         let fat_entries = boot.cluster_count as usize + 2;
         let fat_bytes = fat_entries * 4;
         let fat_region_bytes = boot.fat_length as u64 * bps as u64;
@@ -34,7 +45,7 @@ impl Volume {
         }
 
         let mut fat_buf = vec![0u8; fat_bytes];
-        read_exact_at(&file, &mut fat_buf, fat_sector as u64 * bps as u64)?;
+        read_exact_at(&file, &mut fat_buf, fat_off)?;
         let mut fat = Vec::with_capacity(fat_entries);
         for chunk in fat_buf.as_chunks::<4>().0 {
             fat.push(u32::from_le_bytes(*chunk));
@@ -46,6 +57,8 @@ impl Volume {
             boot,
             oem,
             fat,
+            fat_off,
+            writable,
         })
     }
 
@@ -196,10 +209,135 @@ impl Volume {
         let data_length = chain.len() as u64 * self.cluster_size() as u64;
         self.read_allocation(first, data_length, false)
     }
+
+    pub fn write_cluster(&self, cluster: u32, data: &[u8]) -> Result<()> {
+        self.ensure_write()?;
+        let size = self.cluster_size() as usize;
+        if data.len() != size {
+            return Err(Error::invalid(format!(
+                "cluster write size {} != {size}",
+                data.len()
+            )));
+        }
+        let off = self.cluster_offset(cluster)?;
+        write_all_at(&self.file, data, off)
+    }
+
+    pub fn set_fat(&mut self, cluster: u32, value: u32) -> Result<()> {
+        self.ensure_write()?;
+        let idx = cluster as usize;
+        if idx >= self.fat.len() {
+            return Err(Error::invalid(format!("FAT index {cluster} out of range")));
+        }
+        self.fat[idx] = value;
+        write_all_at(
+            &self.file,
+            &value.to_le_bytes(),
+            self.fat_off + (cluster as u64) * 4,
+        )
+    }
+
+    pub fn read_in_chain(&self, chain: &[u32], offset: u64, buf: &mut [u8]) -> Result<()> {
+        let cs = self.cluster_size() as u64;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let pos = offset + done as u64;
+            let idx = (pos / cs) as usize;
+            let inner = (pos % cs) as usize;
+            if idx >= chain.len() {
+                return Err(Error::invalid("read past end of cluster chain"));
+            }
+            let cluster = self.read_cluster(chain[idx])?;
+            let n = (cluster.len() - inner).min(buf.len() - done);
+            buf[done..done + n].copy_from_slice(&cluster[inner..inner + n]);
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// Write `data` at `offset` bytes into the allocation described by `chain`.
+    pub fn write_in_chain(&self, chain: &[u32], offset: u64, data: &[u8]) -> Result<()> {
+        self.ensure_write()?;
+        let cs = self.cluster_size() as u64;
+        let mut done = 0usize;
+        while done < data.len() {
+            let pos = offset + done as u64;
+            let idx = (pos / cs) as usize;
+            let inner = (pos % cs) as usize;
+            if idx >= chain.len() {
+                return Err(Error::invalid("write past end of cluster chain"));
+            }
+            let mut cluster = self.read_cluster(chain[idx])?;
+            let n = (cluster.len() - inner).min(data.len() - done);
+            cluster[inner..inner + n].copy_from_slice(&data[done..done + n]);
+            self.write_cluster(chain[idx], &cluster)?;
+            done += n;
+        }
+        Ok(())
+    }
+
+    pub fn set_volume_dirty(&mut self, dirty: bool) -> Result<()> {
+        self.ensure_write()?;
+        let mut flags = self.boot.volume_flags.0;
+        if dirty {
+            flags |= VolumeFlags::VOLUME_DIRTY;
+        } else {
+            flags &= !VolumeFlags::VOLUME_DIRTY;
+        }
+        self.boot.volume_flags = VolumeFlags(flags);
+        write_all_at(&self.file, &flags.to_le_bytes(), 106)
+    }
+
+    pub fn write_root_first_cluster(&mut self, cluster: u32) -> Result<()> {
+        self.ensure_write()?;
+        if cluster < 2 || cluster > self.last_cluster() {
+            return Err(Error::invalid(format!(
+                "root cluster {cluster} out of range"
+            )));
+        }
+        self.boot.first_cluster_of_root_directory = cluster;
+        let bps = self.bytes_per_sector();
+        self.patch_boot_root(0, bps, cluster)?;
+        self.patch_boot_root(BACKUP_BOOT_SECTOR as u64 * bps as u64, bps, cluster)?;
+        Ok(())
+    }
+
+    fn patch_boot_root(&self, region_off: u64, bps: u32, cluster: u32) -> Result<()> {
+        let region_len = bps as usize * BOOT_REGION_SECTORS as usize;
+        let mut region = vec![0u8; region_len];
+        read_exact_at(&self.file, &mut region, region_off)?;
+        region[96..100].copy_from_slice(&cluster.to_le_bytes());
+        let checksum = boot_checksum(&region, bps);
+        write_all_at(&self.file, &region, region_off)?;
+        let mut cs_sector = vec![0u8; bps as usize];
+        for chunk in cs_sector.as_chunks_mut::<4>().0 {
+            chunk.copy_from_slice(&checksum.to_le_bytes());
+        }
+        write_all_at(
+            &self.file,
+            &cs_sector,
+            region_off + BOOT_REGION_SECTORS as u64 * bps as u64,
+        )
+    }
+
+    pub fn sync(&self) -> Result<()> {
+        self.file.sync_data().map_err(Error::from)
+    }
+
+    fn ensure_write(&self) -> Result<()> {
+        if !self.writable {
+            return Err(Error::invalid("volume opened read-only"));
+        }
+        Ok(())
+    }
 }
 
 fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> Result<()> {
     file.read_exact_at(buf, offset).map_err(Error::from)
+}
+
+fn write_all_at(file: &File, buf: &[u8], offset: u64) -> Result<()> {
+    file.write_all_at(buf, offset).map_err(Error::from)
 }
 
 fn read_boot_region(file: &File) -> Result<(BootSector, OemParameters)> {
@@ -288,6 +426,26 @@ pub fn chunk_sizes(chain: &[u32], cluster_size: u64, data_length: u64) -> Vec<u6
     }
     sizes.retain(|&s| s > 0);
     sizes
+}
+
+/// Split a cluster chain into maximal runs of consecutive cluster numbers.
+pub fn cluster_extents(chain: &[u32]) -> Vec<Vec<u32>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    for &c in chain {
+        if let Some(&last) = cur.last() {
+            if c == last + 1 {
+                cur.push(c);
+                continue;
+            }
+            out.push(std::mem::take(&mut cur));
+        }
+        cur.push(c);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
 }
 
 #[cfg(test)]

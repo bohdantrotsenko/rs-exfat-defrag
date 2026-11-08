@@ -19,58 +19,134 @@ impl FragmentedEntry {
     }
 }
 
+/// A file or directory on the volume, with enough info to relocate it.
+#[derive(Clone, Debug)]
+pub struct FsEntry {
+    pub path: String,
+    pub is_directory: bool,
+    pub is_root: bool,
+    pub first_cluster: u32,
+    pub data_length: u64,
+    pub no_fat_chain: bool,
+    pub chain: Vec<u32>,
+    /// Parent path (`None` for root).
+    pub parent: Option<String>,
+    /// Byte offset of the File directory entry set in the parent directory.
+    pub dirent_offset: u64,
+    pub set_bytes: usize,
+}
+
+/// Result of a full tree walk, including allocation-bitmap / up-case locations.
+#[derive(Clone, Debug)]
+pub struct VolumeScan {
+    pub entries: Vec<FsEntry>,
+    pub bitmap: Option<AllocationBitmapDirEntry>,
+    pub upcase: Option<UpcaseTableDirEntry>,
+}
+
 /// Walk the directory tree and collect files/directories with more than one cluster run.
 pub fn analyze(vol: &Volume) -> Result<Vec<FragmentedEntry>> {
+    analyze_filtered(vol, false)
+}
+
+pub fn analyze_filtered(vol: &Volume, dir_only: bool) -> Result<Vec<FragmentedEntry>> {
+    let scan = walk_volume(vol)?;
+    let cluster_size = vol.cluster_size() as u64;
     let mut out = Vec::new();
+    for e in &scan.entries {
+        if dir_only && !e.is_directory {
+            continue;
+        }
+        let sizes = chunk_sizes(&e.chain, cluster_size, e.data_length);
+        if sizes.len() > 1 {
+            out.push(FragmentedEntry {
+                path: e.path.clone(),
+                is_directory: e.is_directory,
+                size: e.data_length,
+                chunk_sizes: sizes,
+                clusters: e.chain.len(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub fn walk_volume(vol: &Volume) -> Result<VolumeScan> {
+    let mut entries = Vec::new();
+    let mut bitmap = None;
+    let mut upcase = None;
 
     let root_first = vol.boot.first_cluster_of_root_directory;
     let root_chain = vol.cluster_chain(root_first, 0, false)?;
     let cluster_size = vol.cluster_size() as u64;
     let root_size = root_chain.len() as u64 * cluster_size;
-    let root_chunk_sizes = chunk_sizes(&root_chain, cluster_size, root_size);
-    if root_chunk_sizes.len() > 1 {
-        out.push(FragmentedEntry {
-            path: "/".to_string(),
-            is_directory: true,
-            size: root_size,
-            chunk_sizes: root_chunk_sizes,
-            clusters: root_chain.len(),
-        });
-    }
+    entries.push(FsEntry {
+        path: "/".to_string(),
+        is_directory: true,
+        is_root: true,
+        first_cluster: root_first,
+        data_length: root_size,
+        no_fat_chain: false,
+        chain: root_chain,
+        parent: None,
+        dirent_offset: 0,
+        set_bytes: 0,
+    });
 
     let root_data = vol.read_root_directory()?;
+    let root_scan = scan_directory(&root_data)?;
+    bitmap = root_scan.bitmap.or(bitmap);
+    upcase = root_scan.upcase.or(upcase);
+
     let mut stack: Vec<(String, Vec<u8>)> = vec![(String::new(), root_data)];
 
     while let Some((dir_path, data)) = stack.pop() {
-        for record in parse_directory(&data)? {
+        let scan = if dir_path.is_empty() {
+            root_scan.clone()
+        } else {
+            scan_directory(&data)?
+        };
+        let parent_path = if dir_path.is_empty() {
+            "/".to_string()
+        } else {
+            dir_path.clone()
+        };
+        for (offset, record) in scan.files {
             let chain = vol.cluster_chain(
                 record.first_cluster(),
                 record.data_length(),
                 record.no_fat_chain(),
             )?;
-            let sizes = chunk_sizes(&chain, cluster_size, record.data_length());
             let path = join_path(&dir_path, &record.name);
-            if sizes.len() > 1 {
-                out.push(FragmentedEntry {
-                    path: path.clone(),
-                    is_directory: record.is_directory(),
-                    size: record.data_length(),
-                    chunk_sizes: sizes,
-                    clusters: chain.len(),
-                });
+            let is_directory = record.is_directory();
+            let first = record.first_cluster();
+            let data_length = record.data_length();
+            let no_fat_chain = record.no_fat_chain();
+            let set_bytes = (1 + record.file.secondary_count as usize) * DIR_ENTRY_SIZE;
+            if is_directory && first != 0 {
+                let child = vol.read_allocation(first, data_length, no_fat_chain)?;
+                stack.push((path.clone(), child));
             }
-            if record.is_directory() && record.first_cluster() != 0 {
-                let child = vol.read_allocation(
-                    record.first_cluster(),
-                    record.data_length(),
-                    record.no_fat_chain(),
-                )?;
-                stack.push((path, child));
-            }
+            entries.push(FsEntry {
+                path,
+                is_directory,
+                is_root: false,
+                first_cluster: first,
+                data_length,
+                no_fat_chain,
+                chain,
+                parent: Some(parent_path.clone()),
+                dirent_offset: offset as u64,
+                set_bytes,
+            });
         }
     }
 
-    Ok(out)
+    Ok(VolumeScan {
+        entries,
+        bitmap,
+        upcase,
+    })
 }
 
 fn skip_set(off: usize, len: usize, secondary_count: u8) -> Result<usize> {
@@ -89,8 +165,15 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
-fn parse_directory(data: &[u8]) -> Result<Vec<FileEntrySet>> {
-    let mut entries = Vec::new();
+#[derive(Clone, Debug, Default)]
+struct DirScan {
+    files: Vec<(usize, FileEntrySet)>,
+    bitmap: Option<AllocationBitmapDirEntry>,
+    upcase: Option<UpcaseTableDirEntry>,
+}
+
+fn scan_directory(data: &[u8]) -> Result<DirScan> {
+    let mut scan = DirScan::default();
     let mut off = 0usize;
     while off + DIR_ENTRY_SIZE <= data.len() {
         let raw = RawDirEntry::parse(&data[off..off + DIR_ENTRY_SIZE])?;
@@ -110,7 +193,15 @@ fn parse_directory(data: &[u8]) -> Result<Vec<FileEntrySet>> {
         }
 
         match et.0 {
-            EntryType::ALLOC_BITMAP | EntryType::UPCASE_TABLE | EntryType::VOLUME_LABEL => {
+            EntryType::ALLOC_BITMAP => {
+                scan.bitmap = Some(AllocationBitmapDirEntry::from_raw(raw));
+                off += DIR_ENTRY_SIZE;
+            }
+            EntryType::UPCASE_TABLE => {
+                scan.upcase = Some(UpcaseTableDirEntry::from_raw(raw));
+                off += DIR_ENTRY_SIZE;
+            }
+            EntryType::VOLUME_LABEL => {
                 off += DIR_ENTRY_SIZE;
             }
             EntryType::FILE => {
@@ -120,7 +211,8 @@ fn parse_directory(data: &[u8]) -> Result<Vec<FileEntrySet>> {
                 if off + bytes > data.len() {
                     return Err(Error::invalid("truncated File directory entry set"));
                 }
-                entries.push(parse_file_set(&data[off..off + bytes], file)?);
+                let parsed = parse_file_set(&data[off..off + bytes], file)?;
+                scan.files.push((off, parsed));
                 off += bytes;
             }
             EntryType::VOLUME_GUID => {
@@ -142,7 +234,7 @@ fn parse_directory(data: &[u8]) -> Result<Vec<FileEntrySet>> {
             }
         }
     }
-    Ok(entries)
+    Ok(scan)
 }
 
 fn parse_file_set(bytes: &[u8], file: FileDirEntry) -> Result<FileEntrySet> {
