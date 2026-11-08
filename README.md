@@ -14,9 +14,9 @@ cargo run -- <filesystem>
 
 ```
 TYPE         SIZE CHUNKS  CHUNK SIZES                             PATH
-dir         98304      6  16384+16384+16384+16384+16384+16384     /test
-dir         98304      6  16384+16384+16384+16384+16384+16384     /test/0
-file        4096       3  2048+1024+1024                          /test/1/note.txt
+dir         98304      6  16K+16K+16K+16K+16K+16K                 /test
+dir         98304      6  16K+16K+16K+16K+16K+16K                 /test/0
+file        5000       3  2K+1K+904                               /test/1/note.txt
 ```
 
 | Column        | Meaning |
@@ -24,7 +24,7 @@ file        4096       3  2048+1024+1024                          /test/1/note.t
 | `TYPE`        | `dir` or `file` |
 | `SIZE`        | stream `DataLength` in bytes |
 | `CHUNKS`      | number of contiguous cluster runs |
-| `CHUNK SIZES` | byte size of each run, in chain order (last run may be a partial cluster) |
+| `CHUNK SIZES` | byte size of each run, in chain order. Powers of two use binary units (`16K`, `1M`); other values stay a byte count. The last run may be a partial cluster. |
 | `PATH`        | path from the volume root |
 
 Only entries with **more than one chunk** are printed. A fully contiguous allocation is one chunk and is omitted.
