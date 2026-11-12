@@ -2,7 +2,9 @@
 
 Offline reader and defragmenter for exFAT volumes (disk images or unmounted block devices). It walks the directory tree, reports files and directories whose clusters are not a single contiguous run, and can rewrite those allocations.
 
-On-disk layouts follow Microsoft’s [exFAT File System Specification](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification) revision 1.00.
+**Beta.** This code is at beta stage. Defragmentation rewrites the volume. Use it at your own risk.
+
+On-disk layouts follow Microsoft’s [exFAT File System Specification](https://learn.microsoft.com/en-us/windows/win32/fileio/exfat-specification) revision 1.00. exFAT is a trademark of Microsoft Corporation.
 
 The volume must not be mounted while `--defrag` is running.
 
@@ -73,3 +75,7 @@ src/defrag.rs    relocate allocations, allocation bitmap, --dirfirst packing
 **`analysis`** — iterative directory walk. Each file/directory’s cluster chain is split into maximal consecutive runs. Entries with more than one run are reported.
 
 **`defrag`** — for each object that needs work, finds a free contiguous run (or keeps extents ≥ `--chunk`), copies clusters, then updates the FAT, allocation bitmap, and the Stream Extension (`FirstCluster`, checksum). `--dirfirst` evacuates non-directories from the low cluster prefix, then packs directories there in tree order. The volume dirty flag is set for the duration of the pass.
+
+## License
+
+[MIT](LICENSE).
